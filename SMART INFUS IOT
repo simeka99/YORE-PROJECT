@@ -1,0 +1,623 @@
+#define BLYNK_TEMPLATE_ID   "TMPL6k7s_4Dmq"
+#define BLYNK_TEMPLATE_NAME "INFUS IOT V1"
+#define BLYNK_AUTH_TOKEN    "jpkBIB6f4hYLAd2DcZw94SRp7XuIuLnC"
+
+#define BLYNK_PRINT Serial
+
+#include <ESP8266WiFi.h>
+#include <MetaBlynkESP8266.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <EEPROM.h>
+#include "HX711.h"
+#include <Servo.h>
+
+#define screen_width 128
+#define screen_height 64
+#define oled_reset    -1
+
+Adafruit_SSD1306 display(screen_width, screen_height, &Wire, oled_reset);
+HX711 scale;
+BlynkTimer timer;
+Servo servo;
+
+const char *ssid                = "INFUS";
+const char *pass                = "12345678";
+String      Wifi                = "WiFi: " + String(ssid);
+
+
+// config pin IO
+const uint8_t button_pin        = 0;
+const uint8_t infus_sensor_pin  = 14;
+const uint8_t loadcell_dout_pin = 12;
+const uint8_t loadcell_sck_pin  = 13;
+const uint8_t buzzer_pin        = 15;
+const uint8_t servo_pin         = 16;
+
+// config logical
+uint8_t   button_last           = 1;
+uint8_t   button_toggle         = 0;
+uint32_t  button_tm             = 0;
+uint8_t   button_long_press     = 0;
+uint32_t  tm_interrupt          = 0;
+const uint32_t stable_interrupt = 50;
+uint32_t  last_drop_time        = 0;
+uint32_t  tetes_count           = 0;
+uint8_t   calibration_mode      = 0;
+uint32_t  last_tetes_count      = 0;
+uint32_t  last_tetes_time       = 0;
+uint8_t   input_know_weight_app = 0;
+
+//config database
+uint8_t addr_notif              = 0;
+uint8_t addr_no_kamar           = 15;
+uint8_t addr_weight_know        = 30;
+uint8_t addr_weight_sensor      = 45;
+uint8_t addr_weight_offset      = 60;
+
+// config load data sensor
+uint16_t  offset_weight_sensor  = 86; // weight_gram (sensor infus)
+float     tpd                   = 0;
+uint8_t   tpm                   = 0;
+uint16_t  weight_gram           = 0;
+uint16_t  weight_percentage     = 0;
+uint16_t  last_w_gram           = 0;
+uint16_t  result_gram           = 0;
+uint16_t  result_percentage     = 0;
+
+uint8_t  size_db                = 100;
+String db_notif                 = "";
+String db_no_kamar              = "";
+String db_weight_know           = "";
+String db_weight_sensor         = "";
+String db_weight_offset         = "";
+
+void play_buzzer(const uint16_t duration, const uint8_t counter = 0)
+{
+  uint32_t end_time = millis() + duration;
+  if (!counter)
+  {
+    while (millis() < end_time) digitalWrite(buzzer_pin, 1);
+    digitalWrite(buzzer_pin, 0);
+  }
+  else
+  {
+    for (uint8_t a = 0; a < counter * 2; a++)
+      digitalWrite(buzzer_pin, !(a % 2) ? 1 : 0), delay(duration);
+  }
+}
+
+void save_db(char add, String data, bool restart = false)
+{
+  play_buzzer(200);
+  for (uint8_t i = 0; i < data.length(); i++) EEPROM.write(add + i, data[i]);
+  EEPROM.write(add + data.length(), '\0');
+  EEPROM.commit();
+  if (restart) ESP.restart();
+}
+
+String read_db(char add)
+{
+  char data[15];
+  uint8_t len = 0;
+  char db;
+  do db = EEPROM.read(add + len), data[len++] = db;
+  while (db != '\0' && len < 14);
+  data[len] = '\0';
+  return (len == 1 && data[0] == '\0') ? "0" : String(data);
+}
+
+void reset_db(bool restart = false)
+{
+  play_buzzer(200);
+  for (uint8_t i = 0; i <= size_db; i++)
+    EEPROM.write(i, 0);
+  EEPROM.commit();
+  if (restart) ESP.restart();
+}
+
+BLYNK_WRITE(V2)
+{
+  uint8_t notif = param.asInt();
+  Serial.print("Notif: ");
+  Serial.println(notif);
+  save_db(addr_notif, String (notif));
+}
+
+BLYNK_WRITE(V3)
+{
+  uint8_t no_kamar = param.asInt();
+  Serial.print("No Kamar: ");
+  Serial.println(no_kamar);
+  save_db(addr_no_kamar, String (no_kamar));
+}
+
+BLYNK_WRITE(V4)
+{
+  String kalibrasi = param.asString();
+  Serial.println("Data :" + kalibrasi);
+  process_command(kalibrasi);
+}
+
+//sensor interupt
+void ICACHE_RAM_ATTR read_button()
+{
+  if (digitalRead(button_pin) != button_last)
+  {
+    button_toggle = 1;
+    button_last = !button_last;
+    button_tm = millis();
+    button_long_press = 0;
+  }
+}
+
+void ICACHE_RAM_ATTR count_tetes()
+{
+  if (millis() - tm_interrupt >= stable_interrupt)
+  {
+    tetes_count++;
+    tpd = (millis() - last_drop_time) / 1000.0;
+    tpm = static_cast<uint16_t>(60 / tpd);
+  }
+  last_drop_time = millis();
+  tm_interrupt = millis();
+}
+
+// logic sistem
+bool Button_Short()
+{
+  return button_toggle && millis() > button_tm + 50 ? (button_toggle = 0, button_last == 0 ? 1 : 0) : 0;
+}
+
+bool Button_Long()
+{
+  return !button_long_press && button_last == 0 && (millis() - button_tm >= 1000) ? (button_long_press = 1, 1) : 0;
+}
+
+
+uint16_t conversi_value(float number)
+{
+  uint16_t integer_part = int(number);
+  uint16_t decimal_part = int(number * 10) % 10;
+
+  if (decimal_part >= 6) integer_part++;
+  return integer_part;
+}
+
+uint16_t map_to_percentage(uint16_t value)
+{
+  uint16_t percentage = map(value, 0, 559, 0, 100);
+  return percentage > 100 ? 100 : percentage;
+}
+
+
+uint8_t get_text_width(const char *text)
+{
+  return *text ? strlen(text) * 6 : 0;
+}
+
+void print_text(const char *text, int size_text = 1, uint8_t y = 0, bool d = false)
+{
+  display.drawRoundRect(1, 1, screen_width - 2, screen_height - 2, 4, WHITE);
+  display.setTextColor(WHITE);
+  uint8_t text_width = get_text_width(text) * size_text;
+  display.setCursor((screen_width - text_width) / 2, y);
+  display.setTextSize(size_text);
+  display.println(text);
+  if (d) display.display();
+}
+
+void draw_teks_box(uint8_t x, uint8_t y, uint8_t width, uint8_t height, String title, float value, String satuan = "", bool print_decimal = false)
+{
+  uint8_t radius = 3;
+  display.drawRoundRect(x, y, width, height, radius, WHITE);
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.setCursor(x + 5, y + 5);
+  display.print(title);
+  display.setCursor(x + 5, y + 20);
+  if (print_decimal) display.print(value, 1);
+  else display.print(static_cast<uint32_t>(value));
+  display.print(satuan);
+}
+
+void load_DB(uint8_t s = 0)
+{
+  if (!s)
+    play_buzzer(300);
+
+  db_notif          = read_db(addr_notif);
+  db_no_kamar       = read_db(addr_no_kamar);
+  db_weight_know    = read_db(addr_weight_know);
+  db_weight_sensor  = read_db(addr_weight_sensor);
+  db_weight_offset  = read_db(addr_weight_offset);
+
+  Serial.println("_________DATABASE INFUS_________\n");
+  Serial.print("DB Notif          : ");
+  Serial.println(db_notif);
+  Serial.print("DB No Kamar       : ");
+  Serial.println(db_no_kamar);
+  Serial.print("DB Weight Know    : ");
+  Serial.println(db_weight_know);
+  Serial.print("DB Weight Sensor  : ");
+  Serial.println(db_weight_sensor);
+  Serial.print("DB Weight Offset  : ");
+  Serial.println(db_weight_offset);
+  Serial.println("_________________________________");
+}
+
+void setup_LoadCell()
+{
+  scale.begin(loadcell_dout_pin, loadcell_sck_pin);
+  Serial.println("Load cell is ready!");
+
+  if (db_weight_know.toInt() != 0 && db_weight_sensor.toInt() != 0)
+  {
+    float db_sensor = db_weight_sensor.toFloat();
+    float db_real   = db_weight_know.toFloat();
+    float result    = (db_sensor / db_real);
+    delay(1000);
+    scale.set_scale(result);
+    Serial.print("Result: ");
+    Serial.println(result);
+  }
+  else
+  {
+    delay(1000);
+    scale.set_scale(56.61);//v1
+    Serial.println("Database values are empty or invalid. Using default calibration factor.");
+  }
+  delay(2000);
+  scale.tare();
+}
+
+void setup_IO()
+{
+  EEPROM.begin(size_db);
+  pinMode(button_pin, INPUT_PULLUP);
+  pinMode(buzzer_pin, OUTPUT);
+  servo.attach(servo_pin);
+  servo.write(0);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+  {
+    Serial.println(F("SSD1306 allocation failed"));
+    while (1);
+  }
+  attachInterrupt(digitalPinToInterrupt(infus_sensor_pin), count_tetes, RISING);
+  attachInterrupt(digitalPinToInterrupt(button_pin), read_button, CHANGE);
+  display.clearDisplay();
+}
+
+
+void connect_to_WiFi()
+{
+  display.clearDisplay();
+  display.drawRoundRect(1, 1, screen_width - 2, screen_height - 2, 4, WHITE);
+  display.setTextColor(WHITE);
+  print_text("SMART", 2, 15, true);
+  print_text("INFUS IOT", 2, 40, true);
+  display.display();
+  delay(2000);
+
+  WiFi.disconnect();
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  uint32_t start_tm = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start_tm < 20000)
+  {
+    display.clearDisplay();
+    print_text("Connecting To WiFi", 1, 10);
+    print_text(Wifi.c_str(), 1, 25);
+    for (uint8_t i = 0; i < 9; i++)
+    {
+      display.setCursor(30 + i * 8, 40);
+      display.print("*");
+      delay(300);
+      display.display();
+    }
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    display.clearDisplay();
+    play_buzzer(300);
+    print_text("WIFI", 2, 15);
+    print_text("CONNECTED", 2, 40);
+    display.display();
+    delay(2000);
+  }
+  else
+  {
+    for (int i = 0; i < 5; i++)
+    {
+      display.clearDisplay();
+      print_text("WIFI NOT", 2, 15);
+      print_text("CONNECTED", 2, 40);
+      display.display();
+      digitalWrite(buzzer_pin, HIGH);
+      delay(300);
+      display.clearDisplay();
+      display.display();
+      digitalWrite(buzzer_pin, LOW);
+      delay(300);
+    }
+    connect_to_WiFi();
+  }
+
+  while (!Blynk.config_server(BLYNK_AUTH_TOKEN))
+  {
+    display.clearDisplay();
+    print_text("SERVER NOT", 2, 15);
+    print_text("CONNECTED", 2, 40);
+    display.display();
+  }
+
+  display.clearDisplay();
+  play_buzzer(500);
+  print_text("SERVER", 2, 15);
+  print_text("CONNECTED", 2, 40);
+  display.display();
+  delay(2000);
+  display.clearDisplay();
+}
+
+void Data_Infus()
+{
+  if (!calibration_mode)
+  {
+    float v_gram = scale.get_units(5);
+    if (v_gram < 30)
+    {
+      v_gram = weight_gram = weight_percentage = result_gram = result_percentage = last_w_gram = last_tetes_count = last_tetes_time = 0;
+      display.clearDisplay();
+      draw_teks_box(0, 0, screen_width / 3, screen_height / 2 - 1, "DC: ", tetes_count);
+      draw_teks_box(screen_width / 3, 0, screen_width / 3, screen_height / 2 - 1, "T/D: ", float(tpd), " s", true);
+      draw_teks_box(2 * screen_width / 3, 0, screen_width / 3, screen_height / 2 - 1, "TPM: ", tpm);
+      draw_teks_box(0, screen_height / 2, screen_width / 2, screen_height / 2 - 1, "WEIGHT: ", result_gram, " g");
+      draw_teks_box(screen_width / 2, screen_height / 2, screen_width / 2, screen_height / 2 - 1, "REM.INFUS", result_percentage, " %");
+      display.display();
+    }
+    else if (v_gram != last_w_gram)
+    {
+      weight_gram = conversi_value(v_gram) + read_db(addr_weight_offset).toInt();
+      weight_percentage = map_to_percentage(weight_gram);
+      result_gram = (weight_gram - offset_weight_sensor);
+      result_percentage = map_to_percentage(result_gram);
+      /*
+            Serial.print("Weight -> ");
+            Serial.print(weight_gram);
+            Serial.print(" gram ");
+            Serial.print(" | Persentase: ");
+            Serial.print(weight_percentage);
+            Serial.print(" % | Result Gram: ");
+            Serial.print(result_gram);
+            Serial.print(" gram ");
+            Serial.print(" | Result Persentase: ");
+            Serial.print(result_percentage);
+            Serial.println(" %");
+      */
+    }
+
+    last_w_gram = v_gram;
+
+    display.clearDisplay();
+    draw_teks_box(0, 0, screen_width / 3, screen_height / 2 - 1, "DC: ", tetes_count);
+    draw_teks_box(screen_width / 3, 0, screen_width / 3, screen_height / 2 - 1, "T/D: ", float(tpd), " s", true);
+    draw_teks_box(2 * screen_width / 3, 0, screen_width / 3, screen_height / 2 - 1, "TPM: ", tpm);
+    draw_teks_box(0, screen_height / 2, screen_width / 2, screen_height / 2 - 1, "WEIGHT: ", result_gram, " g");
+    draw_teks_box(screen_width / 2, screen_height / 2, screen_width / 2, screen_height / 2 - 1, "REM.INFUS", result_percentage, " %");
+    display.display();
+    String data = " {\"DC\":" + String(tetes_count) + ",\"T/D\":" + String(tpd, 1) + ",\"TPM\":" + String(tpm) + ",\"WEIGHT\":" + String(result_gram) + ",\"WEIGHT_GRAM\":" + String(weight_gram) + ",\"REM.INFUS\":" + String(result_percentage) + "}";
+    Blynk.virtualWrite(V0, data);
+
+    if (result_percentage < read_db(addr_notif).toInt())
+    {
+      servo.write(110);
+      Blynk.virtualWrite(V1, 1);
+      Serial.println("Infusan Habis");
+    }
+
+    if (tetes_count != last_tetes_count)
+    {
+      last_tetes_count = tetes_count;
+      last_tetes_time = millis();
+    }
+    else
+    {
+      if (millis() - last_tetes_time >= 30000)
+      {
+        Blynk.virtualWrite(V1, 2);
+        Serial.println("Infusan Tidak Jalann");
+      }
+    }
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  while (!Serial) {}
+  Serial.println("\n Sistem Smart Infus Ready!");
+  setup_IO();
+  display.clearDisplay();
+  print_text("REMOVE TUBE", 1, 15, true);
+  print_text("INFUSION", 2, 40, true);
+  display.display();
+  play_buzzer(200, 7);
+  delay(5000);
+  load_DB(1);
+  setup_LoadCell();
+  play_buzzer(300);
+  float v_gram = scale.get_units(5);
+  uint32_t start_time = millis();
+  while (v_gram <= 30)
+  {
+    display.clearDisplay();
+    print_text("PLACE TUBE", 1, 15, true);
+    print_text("INFUSION", 2, 40, true);
+    display.display();
+    v_gram = scale.get_units(5);
+    delay(1000);
+    if ((millis() - start_time) >= 10000)
+      ESP.restart();
+  }
+  delay(1000);
+  display.clearDisplay();
+  print_text("TUBE INFUSION", 1, 15, true);
+  print_text("COMPLETE", 2, 40, true);
+  display.display();
+  play_buzzer(100, 3);
+  delay (2000);
+  connect_to_WiFi();
+}
+
+
+void loop()
+{
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Blynk.run();
+
+    if (Button_Short())
+    {
+      play_buzzer(100, 2);
+      servo.write(0);
+      Blynk.virtualWrite(V1, 0);
+    }
+
+    if (Button_Long())
+    {
+      play_buzzer(300);
+      scale.tare();
+      Data_Infus();
+    }
+
+    Data_Infus();
+  }
+  else
+  {
+    for (int i = 0; i < 5; i++)
+    {
+      display.clearDisplay();
+      print_text("WIFI NOT", 2, 15);
+      print_text("CONNECTED", 2, 40);
+      display.display();
+      digitalWrite(buzzer_pin, HIGH);
+      delay(300);
+      display.clearDisplay();
+      display.display();
+      digitalWrite(buzzer_pin, LOW);
+      delay(300);
+    }
+    connect_to_WiFi();
+  }
+}
+
+
+//config Blynk
+void process_command(String command)
+{
+  Serial.print("Received command: ");
+  Serial.println(command);
+  Serial.println();
+  if (command.startsWith("A"))
+  {
+    if (command.length() == 2)
+    {
+      uint8_t value = command.substring(1).toInt();
+      if (value == 1)
+      {
+        calibration_mode = 1;
+        if (calibration_mode && !input_know_weight_app)
+        {
+          play_buzzer(300);
+          display.clearDisplay();
+          print_text("Calibration Mode", 1, 15, true);
+          delay(1000);
+          scale.set_scale();
+          play_buzzer(200, 2);
+          print_text("Tare,Remove Weights", 1, 30, true);
+          delay(5000);
+          scale.tare();
+          play_buzzer(200, 3);
+          print_text("Place Tube Infusion", 1, 45, true);
+          delay(10000);
+          uint32_t known_weight = scale.get_units(5);
+          uint32_t my_number = known_weight;
+          char buffer[15];
+          sprintf(buffer, "%d", my_number);
+          Serial.print("Known weight: ");
+          Serial.println(known_weight);
+          save_db(addr_weight_sensor, String(known_weight));
+
+          for (int i = 0; i < 3; i++)
+          {
+            display.clearDisplay();
+            print_text("Calibration Success", 1, 15);
+            print_text("Weight Result", 1, 30);
+            print_text(buffer, 1, 45);
+            display.display();
+            digitalWrite(buzzer_pin, HIGH);
+            delay(500);
+            display.clearDisplay();
+            display.display();
+            digitalWrite(buzzer_pin, LOW);
+            delay(500);
+          }
+          display.clearDisplay();
+          print_text("INPUT KNOW", 2, 15);
+          print_text("WEIGHT", 2, 40);
+          display.display();
+          input_know_weight_app = 1;
+        }
+      }
+    }
+  }
+  else if (command.startsWith("B"))
+  {
+    if (input_know_weight_app)
+    {
+      String know_weight = command.substring(1);
+      Serial.println("Data to save: " + know_weight);
+      save_db(addr_weight_know, know_weight, true);
+      input_know_weight_app = 0;
+      calibration_mode = 0;
+    }
+
+  }
+  else if (command.startsWith("C"))
+  {
+    load_DB();
+    //String data = "{\"DB_NOTIF\":" + db_notif + ",\"DB_NO_KAMAR\":" + db_no_kamar + ",\"DB_WEIGHT\":" + db_weight_know + "}";
+    String data = "{";
+    data += "\"DB_NOTIF\":" + String(db_notif);
+    data += ",\"DB_NO_KAMAR\":" + String(db_no_kamar);
+    data += ",\"DB_WEIGHT_KNOW\":" + String(db_weight_know);
+    data += ",\"DB_WEIGHT_SENSOR\":" + String(db_weight_sensor);
+    data += ",\"DB_WEIGHT_OFFSET\":" + String(db_weight_offset);
+    data += "}";
+
+    Blynk.virtualWrite(V4, data);
+  }
+
+  else if (command.startsWith("D"))
+  {
+    reset_db(true);
+    load_DB();
+  }
+  else if (command.startsWith("E"))
+  {
+    String cal_factor = command.substring(1);
+    char sign = cal_factor.charAt(0);
+    uint16_t value = cal_factor.substring(1).toInt();
+    uint16_t current_offset = read_db(addr_weight_offset).toInt();
+    uint16_t new_offset = current_offset + (sign == '-' ? -value : value);
+    save_db(addr_weight_offset, String(new_offset));
+    Serial.print(sign == '-' ? "Subtracting " : "Adding ");
+    Serial.println(abs(value) + " from offset.");
+  }
+}
